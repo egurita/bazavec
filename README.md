@@ -1,6 +1,6 @@
 # bazavec
 
-C++20 header-only vector search. Phase 1 is an exact engine: a 128-byte-aligned arena, scalar / ARM NEON / AVX2 distance kernels, and brute-force top-k. Later phases (HNSW, int8 quantization, hybrid filters, `mmap`) are not in this tree yet.
+C++20 header-only vector search. Phase 1 is an exact engine: a 128-byte-aligned arena, scalar / ARM NEON / AVX2 distance kernels, and brute-force top-k. Phase 2 adds HNSW (`include/bazavec/hnsw.hpp`): layer-0 adjacency in one buffer, a generation-counter visited table, software prefetch on the walk, and parallel insert with a per-node spinlock. Int8 quantization, hybrid filters, and `mmap` are not in this tree yet.
 
 The core has no library dependencies. The public headers live under `include/bazavec/`.
 
@@ -23,8 +23,11 @@ flowchart LR
 | `include/bazavec/distance.hpp` | Scalar baseline plus NEON and AVX2 kernels |
 | `include/bazavec/storage.hpp` | `VectorArena`, stride padded to 128 bytes |
 | `include/bazavec/brute_force.hpp` | Exact top-k |
+| `include/bazavec/hnsw.hpp` | Flattened multi-layer HNSW |
 | `tests/test_phase1.cpp` | Kernel identity, alignment, heap order |
+| `tests/test_phase2.cpp` | Heuristic, graph shape, Recall@10 |
 | `bench/bench_phase1.cpp` | Throughput and top-10 latency |
+| `bench/bench_phase2.cpp` | HNSW build, latency, Recall@10 |
 
 `stride` is `dim` rounded up to 32 floats. Row `i` is `data + i * stride`, so every row starts on a cache line and a 128-wide row has no scalar tail.
 
@@ -36,7 +39,9 @@ Release is the configuration the benchmark measures. On arm64 that is `-O3 -mcpu
 cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -G Ninja
 cmake --build build/release -j
 ./build/release/bazavec_tests
+./build/release/bazavec_phase2_tests
 ./build/release/bench_bazavec
+./build/release/bench_phase2
 ```
 
 Debug turns on UBSan with `-fno-sanitize-recover=undefined`, so a failed check aborts the process:
@@ -85,6 +90,15 @@ Brute-force top-10 over the same 100,000 vectors, 80 queries, microseconds:
 
 That is an **8.30x** end-to-end speedup. The NEON top-1 id matches a linear argmin.
 
+Phase 2 on the same machine, Release, one run. The set is 100,000 vectors of dimension 128 drawn from 200 Gaussians (sigma 0.05, centers uniform in `[-1, 1]^128`). `M = 16`, `ef_construction = 128`, `ef_search = 64`, build across the hardware threads. Recall@10 against brute force was 1.00 over 30 queries. Search latency is microseconds:
+
+| Index | mean | p50 | p99 |
+| --- | ---: | ---: | ---: |
+| HNSW | 49.4 | 45.1 | 89.0 |
+| Brute force, NEON | 818 | 770 | 1240 |
+
+About **20k QPS** and **16.6x** against the NEON scan. Build took 1.14 s. The graph is 31.3 MiB on top of the 48.8 MiB of float vectors. Uniform noise in 128-d is a harsher test: distances concentrate, and the same `ef` does not hold 0.95 once N is large. The unit test covers that distribution at a few thousand vectors.
+
 ## Tests
 
 `bazavec_tests` is 570 checks: padded stride, 128-byte row alignment, zero padding, bit-exact distances on values that are dyadic rationals, a double-precision reference on random data, tie-break by smaller id, and brute-force order against a full sort for L2, inner product, and cosine. Release and Debug/UBSan both pass. The AVX2 kernels were syntax-checked with `-target x86_64-apple-macos14 -mavx2 -mfma`.
@@ -92,7 +106,7 @@ That is an **8.30x** end-to-end speedup. The NEON top-1 id matches a linear argm
 ## Roadmap
 
 1. **Done.** Arena, distance kernels, exact top-k.
-2. Flattened HNSW: contiguous layer-0 adjacency, `__builtin_prefetch` on the random walk, parallel insert with per-node locks.
+2. **Done.** Flattened HNSW: contiguous layer-0 adjacency, `__builtin_prefetch` on the walk, parallel insert with per-node spinlocks.
 3. Symmetric int8 quantization and a bitmap predicate pushed into the graph walk. This Mac reports `hw.optional.arm.FEAT_DotProd = 1`.
 4. A `.vdb` file and `mmap` load. The page size here is 16 KiB.
 5. Recall@10 against the Phase 1 brute-force ground truth, a fuller bench, and an optional `pybind11` wrapper.

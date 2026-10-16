@@ -69,6 +69,9 @@ bazavec_configure(bench_bazavec)
 add_executable(bazavec_phase2_tests tests/test_phase2.cpp)
 bazavec_configure(bazavec_phase2_tests)
 
+add_executable(bench_phase2 bench/bench_phase2.cpp)
+bazavec_configure(bench_phase2)
+
 enable_testing()
 add_test(NAME phase1 COMMAND bazavec_tests)
 add_test(NAME phase2 COMMAND bazavec_phase2_tests)
