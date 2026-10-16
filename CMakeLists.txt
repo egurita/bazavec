@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(bazavec
-  VERSION 0.1.0
+  VERSION 0.2.0
   DESCRIPTION "High-performance vector search and hybrid query engine"
   LANGUAGES CXX)
 
@@ -35,8 +35,10 @@ if(BAZAVEC_ENABLE_ASAN)
 endif()
 message(STATUS "bazavec Debug sanitizers: ${BAZAVEC_DEBUG_SANITIZERS}")
 
+find_package(Threads REQUIRED)
+
 function(bazavec_configure target)
-  target_link_libraries(${target} PRIVATE bazavec)
+  target_link_libraries(${target} PRIVATE bazavec Threads::Threads)
   target_compile_options(${target} PRIVATE
     -Wall
     -Wextra
@@ -63,6 +65,7 @@ bazavec_configure(bazavec_tests)
 
 add_executable(bench_bazavec bench/bench_phase1.cpp)
 bazavec_configure(bench_bazavec)
+
 
 enable_testing()
 add_test(NAME phase1 COMMAND bazavec_tests)
