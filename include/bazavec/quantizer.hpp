@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -149,12 +150,19 @@ class ScalarQuantizer {
     rows_ = arena.size();
   }
 
-  std::vector<std::int8_t> encode_query(std::span<const float> query) const {
-    if (!trained_ || query.size() != dim_ || query.data() == nullptr) {
-      throw std::invalid_argument("ScalarQuantizer::encode_query: expected dim floats");
+  void encode_query_into(std::span<const float> query, std::int8_t* out) const {
+    if (!trained_ || query.size() != dim_ || query.data() == nullptr || out == nullptr) {
+      throw std::invalid_argument("ScalarQuantizer::encode_query_into: expected dim floats");
     }
+    encode_row(query.data(), out);
+    if (stride_ > dim_) {
+      std::memset(out + dim_, 0, stride_ - dim_);
+    }
+  }
+
+  std::vector<std::int8_t> encode_query(std::span<const float> query) const {
     std::vector<std::int8_t> out(stride_, 0);
-    encode_row(query.data(), out.data());
+    encode_query_into(query, out.data());
     return out;
   }
 

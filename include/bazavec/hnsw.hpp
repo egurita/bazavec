@@ -3,6 +3,7 @@
 #include "brute_force.hpp"
 #include "detail/memory.hpp"
 #include "distance.hpp"
+#include "quantizer.hpp"
 #include "storage.hpp"
 
 #include <algorithm>
@@ -146,6 +147,14 @@ class HnswIndex {
 
     std::memcpy(query_block_.get(), query.data(), arena_->dim() * sizeof(float));
     const float* padded = query_block_.get();
+    const std::int8_t* query_codes = nullptr;
+    if (quant_ != nullptr) {
+      if (query_codes_.size() != quant_->stride()) {
+        query_codes_.assign(quant_->stride(), 0);
+      }
+      quant_->encode_query_into(query, query_codes_.data());
+      query_codes = query_codes_.data();
+    }
 
     std::size_t width = ef == 0 ? static_cast<std::size_t>(params_.ef_search) : ef;
     if (width < k) {
@@ -161,10 +170,10 @@ class HnswIndex {
       top = max_level_;
     }
     for (int layer = top; layer > 0; --layer) {
-      search_layer(padded, ep, 1, layer, query_scratch_, accept_all);
+      search_layer(padded, query_codes, ep, 1, layer, query_scratch_, accept_all);
       ep = closest_id(query_scratch_.results, ep);
     }
-    search_layer(padded, ep, width, 0, query_scratch_, accept);
+    search_layer(padded, query_codes, ep, width, 0, query_scratch_, accept);
 
     std::vector<Scored> found = query_scratch_.results;
     std::sort(found.begin(), found.end(), closer_score);
@@ -199,14 +208,37 @@ class HnswIndex {
     std::memset(padded.get(), 0, arena_->stride() * sizeof(float));
     std::memcpy(padded.get(), query.data(), arena_->dim() * sizeof(float));
 
+    std::vector<std::int8_t> encoded;
+    const std::int8_t* query_codes = nullptr;
+    if (quant_ != nullptr) {
+      encoded = quant_->encode_query(query);
+      query_codes = encoded.data();
+    }
     Scratch scratch;
     scratch.pool.reserve(candidates.size() + 1);
     for (std::uint32_t id : candidates) {
-      scratch.pool.push_back(Scored{rank_between(padded.get(), arena_->vector(id)), id});
+      scratch.pool.push_back(Scored{rank_query(padded.get(), query_codes, id), id});
     }
-    select_neighbors_heuristic(padded.get(), m, layer, extend_candidates, keep_pruned_connections, kInvalid,
-                               scratch);
+    select_neighbors_heuristic(padded.get(), query_codes, m, layer, extend_candidates, keep_pruned_connections,
+                               kInvalid, scratch);
     return scratch.chosen;
+  }
+
+  // Distances during build and search use the int8 codes. The quantizer must
+  // outlive the index, and it must already hold one code row per arena vector.
+  // The graph is then a neighbor graph in code space, which is what an int8
+  // query walks. Call this before build().
+  void bind_quantizer(const ScalarQuantizer& quant) {
+    if (built_) {
+      throw std::logic_error("HnswIndex::bind_quantizer: already built");
+    }
+    if (metric_ != Metric::L2Squared) {
+      throw std::invalid_argument("HnswIndex::bind_quantizer: int8 ranking is L2Squared");
+    }
+    if (!quant.trained() || quant.dim() != arena_->dim() || quant.size() != arena_->size()) {
+      throw std::invalid_argument("HnswIndex::bind_quantizer: codes must match the arena");
+    }
+    quant_ = &quant;
   }
 
   const Params& params() const noexcept { return params_; }
@@ -412,6 +444,20 @@ class HnswIndex {
     return metric_ == Metric::L2Squared ? score : -score;
   }
 
+  float rank_query(const float* query, const std::int8_t* query_codes, std::uint32_t id) const noexcept {
+    if (quant_ != nullptr) {
+      return static_cast<float>(l2_squared_i8_simd(query_codes, quant_->row(id), quant_->stride()));
+    }
+    return rank_between(query, arena_->vector(id));
+  }
+
+  float rank_nodes(std::uint32_t a, std::uint32_t b) const noexcept {
+    if (quant_ != nullptr) {
+      return static_cast<float>(l2_squared_i8_simd(quant_->row(a), quant_->row(b), quant_->stride()));
+    }
+    return rank_between(arena_->vector(a), arena_->vector(b));
+  }
+
   float score_from_rank(float rank) const noexcept {
     return metric_ == Metric::L2Squared ? rank : -rank;
   }
@@ -495,6 +541,17 @@ class HnswIndex {
   }
 
   void prefetch_row(std::uint32_t id) const noexcept {
+    if (quant_ != nullptr) {
+      const char* bytes = reinterpret_cast<const char*>(quant_->row(id));
+      const char* end = reinterpret_cast<const char*>(quant_->row(0)) + quant_->size() * quant_->stride();
+      if (bytes + 128 <= end) {
+        __builtin_prefetch(bytes, 0, 3);
+      }
+      if (quant_->stride() > 64 && bytes + 192 <= end) {
+        __builtin_prefetch(bytes + 64, 0, 3);
+      }
+      return;
+    }
     const char* bytes = reinterpret_cast<const char*>(arena_->vector(id));
     const std::size_t size = arena_->stride() * sizeof(float);
     __builtin_prefetch(bytes, 0, 3);
@@ -574,8 +631,9 @@ class HnswIndex {
   // all land in the same direction. keep_pruned_connections fills any leftover
   // slots with the rejected (closer, redundant) nodes so a sparse region still
   // reaches degree M.
-  void select_neighbors_heuristic(const float* padded_query, std::size_t m, int layer, bool extend_candidates,
-                                  bool keep_pruned_connections, std::uint32_t skip_id, Scratch& scratch) const {
+  void select_neighbors_heuristic(const float* padded_query, const std::int8_t* query_codes, std::size_t m,
+                                  int layer, bool extend_candidates, bool keep_pruned_connections,
+                                  std::uint32_t skip_id, Scratch& scratch) const {
     scratch.chosen.clear();
     if (m == 0 || scratch.pool.empty()) {
       scratch.discarded.clear();
@@ -609,7 +667,7 @@ class HnswIndex {
           if (seen) {
             continue;
           }
-          scratch.pool.push_back(Scored{rank_between(padded_query, arena_->vector(other)), other});
+          scratch.pool.push_back(Scored{rank_query(padded_query, query_codes, other), other});
         }
       }
     }
@@ -640,10 +698,9 @@ class HnswIndex {
       if (scratch.chosen.size() >= m) {
         break;
       }
-      const float* cand_vec = arena_->vector(cand.id);
       bool diverse = true;
       for (std::uint32_t kept : scratch.chosen) {
-        if (rank_between(cand_vec, arena_->vector(kept)) < cand.rank) {
+        if (rank_nodes(cand.id, kept) < cand.rank) {
           diverse = false;
           break;
         }
@@ -670,8 +727,8 @@ class HnswIndex {
   // heap yields the closest node; the result heap keeps the ef closest hits, worst
   // on top. Rejected ids are still expanded when they fall inside that beam.
   template <class Accept>
-  void search_layer(const float* query, std::uint32_t ep, std::size_t ef, int layer, Scratch& scratch,
-                    Accept accept) const {
+  void search_layer(const float* query, const std::int8_t* query_codes, std::uint32_t ep, std::size_t ef,
+                    int layer, Scratch& scratch, Accept accept) const {
     scratch.candidates.clear();
     scratch.results.clear();
     if (ef == 0) {
@@ -679,7 +736,7 @@ class HnswIndex {
     }
     scratch.visited.next();
     scratch.visited.try_visit(ep);
-    const Scored first{rank_between(query, arena_->vector(ep)), ep};
+    const Scored first{rank_query(query, query_codes, ep), ep};
     push_closer(scratch.candidates, first);
     if (accept(ep)) {
       push_farther(scratch.results, first);
@@ -706,7 +763,7 @@ class HnswIndex {
         if (!scratch.visited.try_visit(candidate)) {
           continue;
         }
-        const float rank = rank_between(query, arena_->vector(candidate));
+        const float rank = rank_query(query, query_codes, candidate);
         const bool room = scratch.results.empty() || scratch.results.size() < ef ||
                           rank < scratch.results.front().rank;
         if (!room) {
@@ -749,12 +806,13 @@ class HnswIndex {
     // The list is at most 2M entries. Pruning it under the lock is a few dozen
     // distances, and it avoids a compare-and-swap retry on the published list.
     const float* origin = arena_->vector(node);
+    const std::int8_t* origin_codes = quant_ != nullptr ? quant_->row(node) : nullptr;
     scratch.pool.clear();
     for (std::uint16_t i = 0; i < degree; ++i) {
-      scratch.pool.push_back(Scored{rank_between(origin, arena_->vector(ids[i])), ids[i]});
+      scratch.pool.push_back(Scored{rank_nodes(node, ids[i]), ids[i]});
     }
-    scratch.pool.push_back(Scored{rank_between(origin, arena_->vector(newbie)), newbie});
-    select_neighbors_heuristic(origin, cap, layer, false, true, node, scratch);
+    scratch.pool.push_back(Scored{rank_nodes(node, newbie), newbie});
+    select_neighbors_heuristic(origin, origin_codes, cap, layer, false, true, node, scratch);
     const auto kept = static_cast<std::uint16_t>(scratch.chosen.size());
     for (std::uint16_t i = 0; i < kept; ++i) {
       ids[i] = scratch.chosen[i];
@@ -765,6 +823,7 @@ class HnswIndex {
 
   void insert(std::uint32_t id, Scratch& scratch) {
     const float* query = arena_->vector(id);
+    const std::int8_t* query_codes = quant_ != nullptr ? quant_->row(id) : nullptr;
     const int level = static_cast<int>(levels_[id]);
     std::uint32_t ep = 0;
     int top = 0;
@@ -775,16 +834,16 @@ class HnswIndex {
     }
 
     for (int layer = top; layer > level; --layer) {
-      search_layer(query, ep, 1, layer, scratch, accept_all);
+      search_layer(query, query_codes, ep, 1, layer, scratch, accept_all);
       ep = closest_id(scratch.results, ep);
     }
 
     const int linked_top = level < top ? level : top;
     for (int layer = linked_top; layer >= 0; --layer) {
-      search_layer(query, ep, params_.ef_construction, layer, scratch, accept_all);
+      search_layer(query, query_codes, ep, params_.ef_construction, layer, scratch, accept_all);
       scratch.pool.clear();
       scratch.pool.insert(scratch.pool.end(), scratch.results.begin(), scratch.results.end());
-      select_neighbors_heuristic(query, max_m_, layer, false, true, id, scratch);
+      select_neighbors_heuristic(query, query_codes, max_m_, layer, false, true, id, scratch);
 
       std::uint32_t linked[128];
       const auto linked_n = static_cast<std::uint16_t>(scratch.chosen.size());
@@ -818,6 +877,8 @@ class HnswIndex {
   int max_level_ = -1;
   bool built_ = false;
   std::atomic<bool> constructing_{false};
+  const ScalarQuantizer* quant_ = nullptr;
+  mutable std::vector<std::int8_t> query_codes_;
   mutable std::mutex ep_mu_;
   template <class T>
   struct RawBuf {

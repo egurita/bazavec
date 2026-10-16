@@ -6,6 +6,7 @@
 #include <iostream>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -23,6 +24,28 @@ void check(bool condition, const char* expression, const char* file, int line) {
 }
 
 #define CHECK(condition) ::check(static_cast<bool>(condition), #condition, __FILE__, __LINE__)
+
+bool throws_invalid(const auto& fn) {
+  try {
+    fn();
+  } catch (const std::invalid_argument&) {
+    return true;
+  } catch (...) {
+    return false;
+  }
+  return false;
+}
+
+bool throws_logic(const auto& fn) {
+  try {
+    fn();
+  } catch (const std::logic_error&) {
+    return true;
+  } catch (...) {
+    return false;
+  }
+  return false;
+}
 
 bazavec::VectorArena make_arena(std::size_t n, std::size_t dim, std::uint32_t seed) {
   bazavec::VectorArena arena(dim);
@@ -199,12 +222,75 @@ void test_filtered_hnsw_recall() {
   CHECK(recall > 0.95f);
 }
 
+void test_int8_hnsw_recall() {
+  constexpr std::size_t kN = 400;
+  constexpr std::size_t kDim = 32;
+  bazavec::VectorArena arena = make_arena(kN, kDim, 19);
+  bazavec::ScalarQuantizer quant;
+  quant.train(arena);
+  quant.encode(arena);
+
+  bazavec::HnswIndex::Params params;
+  params.m = 8;
+  params.ef_construction = 64;
+  params.ef_search = 64;
+  params.threads = 1;
+  params.seed = 3;
+  bazavec::HnswIndex index(arena, bazavec::Metric::L2Squared, params);
+  index.bind_quantizer(quant);
+  CHECK(throws_logic([&] { index.bind_quantizer(quant); }) == false);
+  index.build();
+  CHECK(throws_logic([&] { index.bind_quantizer(quant); }));
+
+  bazavec::HnswIndex ip(arena, bazavec::Metric::InnerProduct, params);
+  CHECK(throws_invalid([&] { ip.bind_quantizer(quant); }));
+
+  std::mt19937 rng(21);
+  std::uniform_real_distribution<float> dist(-1.f, 1.f);
+  std::vector<float> query(kDim);
+  double recall_acc = 0.0;
+  constexpr int kQueries = 12;
+  for (int q = 0; q < kQueries; ++q) {
+    for (float& value : query) {
+      value = dist(rng);
+    }
+    const std::vector<std::int8_t> encoded = quant.encode_query(query);
+    std::vector<bazavec::Hit> pool;
+    pool.reserve(kN);
+    for (std::uint32_t id = 0; id < kN; ++id) {
+      const auto score = static_cast<float>(
+          bazavec::l2_squared_i8_simd(encoded.data(), quant.row(id), quant.stride()));
+      pool.push_back(bazavec::Hit{id, score});
+    }
+    std::sort(pool.begin(), pool.end(), [](const bazavec::Hit& a, const bazavec::Hit& b) {
+      if (a.score < b.score) {
+        return true;
+      }
+      if (b.score < a.score) {
+        return false;
+      }
+      return a.id < b.id;
+    });
+    pool.resize(10);
+    std::vector<std::uint32_t> truth;
+    for (const bazavec::Hit& hit : pool) {
+      truth.push_back(hit.id);
+    }
+    const std::vector<bazavec::Hit> got = index.search_knn(query, 10);
+    recall_acc += static_cast<double>(recall_ids(got, truth));
+  }
+  const float recall = static_cast<float>(recall_acc / kQueries);
+  std::cout << "int8 hnsw recall@10 " << recall << "\n";
+  CHECK(recall > 0.95f);
+}
+
 }  // namespace
 
 int main() {
   test_quantizer_roundtrip_and_simd();
   test_bitset_predicate();
   test_filtered_hnsw_recall();
+  test_int8_hnsw_recall();
   std::cout << "phase 3 tests: " << g_passed << " passed, " << g_failed << " failed\n";
   return g_failed == 0 ? 0 : 1;
 }
