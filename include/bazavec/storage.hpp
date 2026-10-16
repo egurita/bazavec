@@ -36,14 +36,32 @@ class VectorArena {
   VectorArena(const VectorArena&) = delete;
   VectorArena& operator=(const VectorArena&) = delete;
 
+  // `external` is a 128-byte-aligned row-major matrix of `rows` * padded_stride(dim)
+  // floats. The arena does not free it. Used by the mmap loader.
+  VectorArena(float* external, std::size_t rows, std::size_t dim)
+      : dim_(dim),
+        stride_(padded_stride(dim)),
+        size_(rows),
+        capacity_(rows),
+        external_(external) {
+    if (dim_ == 0 || external_ == nullptr) {
+      throw std::invalid_argument("VectorArena: mapped view needs a positive dim and a pointer");
+    }
+    if (reinterpret_cast<std::uintptr_t>(external_) % kArenaAlignment != 0) {
+      throw std::invalid_argument("VectorArena: mapped rows must be 128-byte aligned");
+    }
+  }
+
   VectorArena(VectorArena&& other) noexcept
       : dim_(other.dim_),
         stride_(other.stride_),
         size_(other.size_),
         capacity_(other.capacity_),
-        block_(std::move(other.block_)) {
+        block_(std::move(other.block_)),
+        external_(other.external_) {
     other.size_ = 0;
     other.capacity_ = 0;
+    other.external_ = nullptr;
   }
 
   VectorArena& operator=(VectorArena&& other) noexcept {
@@ -53,8 +71,10 @@ class VectorArena {
       size_ = other.size_;
       capacity_ = other.capacity_;
       block_ = std::move(other.block_);
+      external_ = other.external_;
       other.size_ = 0;
       other.capacity_ = 0;
+      other.external_ = nullptr;
     }
     return *this;
   }
@@ -62,6 +82,9 @@ class VectorArena {
   ~VectorArena() = default;
 
   void reserve(std::size_t n) {
+    if (external_ != nullptr) {
+      throw std::logic_error("VectorArena: mapped view is read-only");
+    }
     if (n <= capacity_) {
       return;
     }
@@ -128,12 +151,12 @@ class VectorArena {
     return add_many(values.data(), 1);
   }
 
-  const float* data() const noexcept { return block_.get(); }
+  const float* data() const noexcept { return external_ != nullptr ? external_ : block_.get(); }
 
   // Precondition: id < size().
   const float* vector(std::uint32_t id) const noexcept {
     assert(id < size_);
-    const float* row = block_.get() + static_cast<std::size_t>(id) * stride_;
+    const float* row = data() + static_cast<std::size_t>(id) * stride_;
     assert(reinterpret_cast<std::uintptr_t>(row) % kArenaAlignment == 0);
     return row;
   }
@@ -146,11 +169,13 @@ class VectorArena {
   std::size_t bytes() const noexcept { return size_ * stride_ * sizeof(float); }
 
   std::size_t allocated_bytes() const noexcept {
-    if (capacity_ == 0) {
+    if (external_ != nullptr || capacity_ == 0) {
       return 0;
     }
     return detail::allocation_bytes(capacity_ * stride_);
   }
+
+  bool mapped() const noexcept { return external_ != nullptr; }
 
  private:
   std::size_t dim_;
@@ -158,6 +183,7 @@ class VectorArena {
   std::size_t size_;
   std::size_t capacity_;
   detail::AlignedPtr block_;
+  float* external_ = nullptr;
 };
 
 static_assert(VectorArena::padded_stride(1) == 32);

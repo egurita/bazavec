@@ -1,6 +1,6 @@
 # bazavec
 
-C++20 header-only vector search. Phase 1 is an exact engine: a 128-byte-aligned arena, scalar / ARM NEON / AVX2 distance kernels, and brute-force top-k. Phase 2 adds HNSW (`include/bazavec/hnsw.hpp`): layer-0 adjacency in one buffer, a generation-counter visited table, software prefetch on the walk, and parallel insert with a per-node spinlock. Phase 3 adds symmetric int8 quantization (`quantizer.hpp`) and a bitmap predicate pushed into the layer-0 walk (`filter.hpp`). `mmap` persistence is not in this tree yet.
+C++20 header-only vector search. Phase 1 is an exact engine: a 128-byte-aligned arena, scalar / ARM NEON / AVX2 distance kernels, and brute-force top-k. Phase 2 adds HNSW (`include/bazavec/hnsw.hpp`): layer-0 adjacency in one buffer, a generation-counter visited table, software prefetch on the walk, and parallel insert with a per-node spinlock. Phase 3 adds symmetric int8 quantization (`quantizer.hpp`) and a bitmap predicate pushed into the layer-0 walk (`filter.hpp`). Phase 4 writes a `.bzv` file and maps it back with `mmap` (`persistence.hpp`); the float rows and the graph arrays are pointers into that mapping.
 
 The core has no library dependencies. The public headers live under `include/bazavec/`.
 
@@ -26,6 +26,7 @@ flowchart LR
 | `include/bazavec/hnsw.hpp` | Flattened multi-layer HNSW |
 | `include/bazavec/quantizer.hpp` | FP32 to int8, NEON/AVX2 integer L2 |
 | `include/bazavec/filter.hpp` | Column filter compiled to a bitset |
+| `include/bazavec/persistence.hpp` | `.bzv` header, CRC32, `mmap` load |
 | `tests/test_phase1.cpp` | Kernel identity, alignment, heap order |
 | `tests/test_phase2.cpp` | Heuristic, graph shape, Recall@10 |
 | `bench/bench_phase1.cpp` | Throughput and top-10 latency |
@@ -111,5 +112,5 @@ About **20k QPS** and **16.6x** against the NEON scan. Build took 1.14 s. The gr
 1. **Done.** Arena, distance kernels, exact top-k.
 2. **Done.** Flattened HNSW: contiguous layer-0 adjacency, `__builtin_prefetch` on the walk, parallel insert with per-node spinlocks.
 3. **Done.** Symmetric int8 quantization and a bitmap predicate pushed into the layer-0 walk. This Mac reports `hw.optional.arm.FEAT_DotProd = 1`. The int8 kernel is a widening multiply, not a dot-product instruction: a squared int8 delta does not fit in int16.
-4. A `.vdb` file and `mmap` load. The page size here is 16 KiB.
+4. **Done.** A `.bzv` file: 64-byte header, payload at offset 128, CRC32, `mmap` load. The page size here is 16 KiB, so the float matrix stays 128-byte aligned.
 5. Recall@10 against the Phase 1 brute-force ground truth, a fuller bench, and an optional `pybind11` wrapper.

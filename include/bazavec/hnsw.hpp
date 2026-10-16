@@ -216,7 +216,7 @@ class HnswIndex {
   std::uint32_t entry_point() const noexcept { return enter_; }
   int max_level() const noexcept { return max_level_; }
   std::uint32_t layer0_stride() const noexcept { return max_m0_; }
-  const std::uint32_t* layer0_data() const noexcept { return adj0_.data(); }
+  const std::uint32_t* layer0_data() const noexcept { return adj0_.ptr; }
 
   std::uint16_t layer0_degree(std::uint32_t id) const {
     assert(id < node_count_);
@@ -224,10 +224,54 @@ class HnswIndex {
   }
 
   std::size_t graph_bytes() const noexcept {
-    return adj0_.size() * sizeof(std::uint32_t) + deg0_.size() * sizeof(std::uint16_t) +
-           upper_edges_.size() * sizeof(std::uint32_t) + upper_deg_.size() * sizeof(std::uint16_t) +
-           upper_slot_.size() * sizeof(std::uint32_t) + levels_.size() * sizeof(std::uint8_t) +
-           static_cast<std::size_t>(node_count_) * sizeof(SpinLock);
+    const std::size_t locks = locks_ ? static_cast<std::size_t>(node_count_) * sizeof(SpinLock) : 0;
+    return adj0_.size * sizeof(std::uint32_t) + deg0_.size * sizeof(std::uint16_t) +
+           upper_edges_.size * sizeof(std::uint32_t) + upper_deg_.size * sizeof(std::uint16_t) +
+           upper_slot_.size * sizeof(std::uint32_t) + levels_.size * sizeof(std::uint8_t) + locks;
+  }
+
+  // Non-owning view of the arrays build() filled. save_bzv writes these bytes.
+  struct GraphImage {
+    const std::uint8_t* levels = nullptr;
+    std::size_t nodes = 0;
+    const std::uint16_t* degree0 = nullptr;
+    const std::uint32_t* neighbors0 = nullptr;
+    std::size_t neighbors0_len = 0;
+    const std::uint32_t* upper_slot = nullptr;
+    const std::uint16_t* upper_degree = nullptr;
+    std::size_t upper_degree_len = 0;
+    const std::uint32_t* upper_edges = nullptr;
+    std::size_t upper_edges_len = 0;
+  };
+
+  GraphImage graph_image() const {
+    return GraphImage{levels_.ptr, levels_.size, deg0_.ptr,     adj0_.ptr,     adj0_.size,
+                      upper_slot_.ptr, upper_deg_.ptr, upper_deg_.size, upper_edges_.ptr, upper_edges_.size};
+  }
+
+  // Point the index at bytes owned by an mmap. The arena must already view the
+  // same file's float matrix. Search does not allocate those arrays.
+  void restore_mapped(std::uint8_t* levels, std::uint16_t* degree0, std::uint32_t* neighbors0,
+                      std::size_t neighbors0_len, std::uint32_t* upper_slot, std::uint16_t* upper_degree,
+                      std::size_t upper_degree_len, std::uint32_t* upper_edges, std::size_t upper_edges_len,
+                      std::uint32_t entry, int max_level) {
+    if (built_) {
+      throw std::logic_error("HnswIndex::restore_mapped: already built");
+    }
+    if (arena_->size() == 0) {
+      throw std::invalid_argument("HnswIndex::restore_mapped: empty arena");
+    }
+    node_count_ = static_cast<std::uint32_t>(arena_->size());
+    levels_.alias(levels, node_count_);
+    deg0_.alias(degree0, node_count_);
+    adj0_.alias(neighbors0, neighbors0_len);
+    upper_slot_.alias(upper_slot, node_count_);
+    upper_deg_.alias(upper_degree, upper_degree_len);
+    upper_edges_.alias(upper_edges, upper_edges_len);
+    enter_ = entry;
+    max_level_ = max_level;
+    prepare_scratch(query_scratch_, params_.ef_search);
+    built_ = true;
   }
 
  private:
@@ -411,7 +455,7 @@ class HnswIndex {
 
   void allocate(std::size_t n) {
     node_count_ = static_cast<std::uint32_t>(n);
-    levels_.assign(n, 0);
+    levels_.reset(n);
     std::mt19937_64 rng(params_.seed);
     std::uniform_real_distribution<double> unit(0.0, 1.0);
     std::size_t upper_nodes = 0;
@@ -433,16 +477,18 @@ class HnswIndex {
       }
     }
 
-    adj0_.assign(n * static_cast<std::size_t>(max_m0_), 0);
-    deg0_.assign(n, 0);
-    upper_slot_.assign(n, kInvalid);
-    upper_edges_.assign(upper_nodes * static_cast<std::size_t>(kMaxLevel) * max_m_, 0);
-    upper_deg_.assign(upper_nodes * static_cast<std::size_t>(kMaxLevel), 0);
+    adj0_.reset(n * static_cast<std::size_t>(max_m0_));
+    deg0_.reset(n);
+    upper_slot_.reset(n);
+    upper_edges_.reset(upper_nodes * static_cast<std::size_t>(kMaxLevel) * max_m_);
+    upper_deg_.reset(upper_nodes * static_cast<std::size_t>(kMaxLevel));
     std::uint32_t slot = 0;
     for (std::size_t i = 0; i < n; ++i) {
       if (levels_[i] > 0) {
         upper_slot_[i] = slot;
         ++slot;
+      } else {
+        upper_slot_[i] = kInvalid;
       }
     }
     locks_.reset(new SpinLock[n]);
@@ -773,12 +819,34 @@ class HnswIndex {
   bool built_ = false;
   std::atomic<bool> constructing_{false};
   mutable std::mutex ep_mu_;
-  std::vector<std::uint8_t> levels_;
-  std::vector<std::uint32_t> adj0_;
-  std::vector<std::uint16_t> deg0_;
-  std::vector<std::uint32_t> upper_slot_;
-  std::vector<std::uint32_t> upper_edges_;
-  std::vector<std::uint16_t> upper_deg_;
+  template <class T>
+  struct RawBuf {
+    T* ptr = nullptr;
+    std::size_t size = 0;
+    std::unique_ptr<T[]> owned;
+
+    void reset(std::size_t n) {
+      owned.reset(n == 0 ? nullptr : new T[n]());
+      ptr = owned.get();
+      size = n;
+    }
+
+    void alias(T* pointer, std::size_t n) noexcept {
+      owned.reset();
+      ptr = pointer;
+      size = n;
+    }
+
+    T& operator[](std::size_t i) noexcept { return ptr[i]; }
+    const T& operator[](std::size_t i) const noexcept { return ptr[i]; }
+  };
+
+  RawBuf<std::uint8_t> levels_;
+  RawBuf<std::uint32_t> adj0_;
+  RawBuf<std::uint16_t> deg0_;
+  RawBuf<std::uint32_t> upper_slot_;
+  RawBuf<std::uint32_t> upper_edges_;
+  RawBuf<std::uint16_t> upper_deg_;
   std::unique_ptr<SpinLock[]> locks_;
   mutable detail::AlignedPtr query_block_;
   mutable Scratch query_scratch_;
