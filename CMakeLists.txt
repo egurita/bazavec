@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(bazavec
-  VERSION 0.2.0
+  VERSION 0.3.0
   DESCRIPTION "High-performance vector search and hybrid query engine"
   LANGUAGES CXX)
 
@@ -69,12 +69,16 @@ bazavec_configure(bench_bazavec)
 add_executable(bazavec_phase2_tests tests/test_phase2.cpp)
 bazavec_configure(bazavec_phase2_tests)
 
+add_executable(bazavec_phase3_tests tests/test_phase3.cpp)
+bazavec_configure(bazavec_phase3_tests)
+
 add_executable(bench_phase2 bench/bench_phase2.cpp)
 bazavec_configure(bench_phase2)
 
 enable_testing()
 add_test(NAME phase1 COMMAND bazavec_tests)
 add_test(NAME phase2 COMMAND bazavec_phase2_tests)
+add_test(NAME phase3 COMMAND bazavec_phase3_tests)
 
 message(STATUS "bazavec processor: ${CMAKE_SYSTEM_PROCESSOR}")
 message(STATUS "bazavec build type: ${CMAKE_BUILD_TYPE}")
