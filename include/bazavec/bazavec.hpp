@@ -11,7 +11,7 @@
 namespace bazavec {
 
 inline constexpr int kVersionMajor = 0;
-inline constexpr int kVersionMinor = 4;
+inline constexpr int kVersionMinor = 5;
 inline constexpr int kVersionPatch = 0;
 
 }  // namespace bazavec
