@@ -129,7 +129,11 @@ class HnswIndex {
   }
 
   // `ef == 0` uses Params::ef_search. The width is raised to at least k.
-  std::vector<Hit> search_knn(std::span<const float> query, std::size_t k, std::size_t ef = 0) const {
+  // `accept` is applied on layer 0 only: a rejected node is not a hit, but it
+  // stays in the beam so the walk can cross it. Upper layers ignore it and
+  // descend to the geometric neighborhood first.
+  template <class Accept>
+  std::vector<Hit> search_knn(std::span<const float> query, std::size_t k, std::size_t ef, Accept accept) const {
     if (!built_) {
       throw std::logic_error("HnswIndex::search_knn: build() was not called");
     }
@@ -157,10 +161,10 @@ class HnswIndex {
       top = max_level_;
     }
     for (int layer = top; layer > 0; --layer) {
-      search_layer(padded, ep, 1, layer, query_scratch_);
+      search_layer(padded, ep, 1, layer, query_scratch_, accept_all);
       ep = closest_id(query_scratch_.results, ep);
     }
-    search_layer(padded, ep, width, 0, query_scratch_);
+    search_layer(padded, ep, width, 0, query_scratch_, accept);
 
     std::vector<Scored> found = query_scratch_.results;
     std::sort(found.begin(), found.end(), closer_score);
@@ -173,6 +177,10 @@ class HnswIndex {
       hits.push_back(Hit{item.id, score_from_rank(item.rank)});
     }
     return hits;
+  }
+
+  std::vector<Hit> search_knn(std::span<const float> query, std::size_t k, std::size_t ef = 0) const {
+    return search_knn(query, k, ef, accept_all);
   }
 
   // Algorithm 4. `query` has dim floats; it is padded internally. Candidate ids
@@ -610,9 +618,14 @@ class HnswIndex {
     }
   }
 
+  static constexpr auto accept_all = [](std::uint32_t) noexcept { return true; };
+
   // Algorithm 2. `rank` is smaller-is-better for every metric. The candidate
-  // heap yields the closest node; the result heap keeps the ef closest, worst on top.
-  void search_layer(const float* query, std::uint32_t ep, std::size_t ef, int layer, Scratch& scratch) const {
+  // heap yields the closest node; the result heap keeps the ef closest hits, worst
+  // on top. Rejected ids are still expanded when they fall inside that beam.
+  template <class Accept>
+  void search_layer(const float* query, std::uint32_t ep, std::size_t ef, int layer, Scratch& scratch,
+                    Accept accept) const {
     scratch.candidates.clear();
     scratch.results.clear();
     if (ef == 0) {
@@ -622,10 +635,13 @@ class HnswIndex {
     scratch.visited.try_visit(ep);
     const Scored first{rank_between(query, arena_->vector(ep)), ep};
     push_closer(scratch.candidates, first);
-    push_farther(scratch.results, first);
+    if (accept(ep)) {
+      push_farther(scratch.results, first);
+    }
 
     while (!scratch.candidates.empty()) {
-      if (scratch.results.size() >= ef && scratch.candidates.front().rank > scratch.results.front().rank) {
+      if (!scratch.results.empty() && scratch.results.size() >= ef &&
+          scratch.candidates.front().rank > scratch.results.front().rank) {
         break;
       }
       const Scored current = pop_closer(scratch.candidates);
@@ -645,8 +661,13 @@ class HnswIndex {
           continue;
         }
         const float rank = rank_between(query, arena_->vector(candidate));
-        if (scratch.results.size() < ef || rank < scratch.results.front().rank) {
-          push_closer(scratch.candidates, Scored{rank, candidate});
+        const bool room = scratch.results.empty() || scratch.results.size() < ef ||
+                          rank < scratch.results.front().rank;
+        if (!room) {
+          continue;
+        }
+        push_closer(scratch.candidates, Scored{rank, candidate});
+        if (accept(candidate)) {
           push_farther(scratch.results, Scored{rank, candidate});
           if (scratch.results.size() > ef) {
             pop_farther(scratch.results);
@@ -708,13 +729,13 @@ class HnswIndex {
     }
 
     for (int layer = top; layer > level; --layer) {
-      search_layer(query, ep, 1, layer, scratch);
+      search_layer(query, ep, 1, layer, scratch, accept_all);
       ep = closest_id(scratch.results, ep);
     }
 
     const int linked_top = level < top ? level : top;
     for (int layer = linked_top; layer >= 0; --layer) {
-      search_layer(query, ep, params_.ef_construction, layer, scratch);
+      search_layer(query, ep, params_.ef_construction, layer, scratch, accept_all);
       scratch.pool.clear();
       scratch.pool.insert(scratch.pool.end(), scratch.results.begin(), scratch.results.end());
       select_neighbors_heuristic(query, max_m_, layer, false, true, id, scratch);
