@@ -1,0 +1,8 @@
+build/
+cmake-build-*/
+.cache/
+.idea/
+.DS_Store
+compile_commands.json
+*.vdb
+*.bzv
