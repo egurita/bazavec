@@ -29,6 +29,7 @@ flowchart LR
 | `include/bazavec/persistence.hpp` | `.bzv` header, CRC32, `mmap` load |
 | `tests/test_phase1.cpp` | Kernel identity, alignment, heap order |
 | `tests/test_phase2.cpp` | Heuristic, graph shape, Recall@10 |
+| `tests/test_phase4.cpp` | Save, zero-copy load, checksum |
 | `bench/bench_phase1.cpp` | Throughput and top-10 latency |
 | `bench/bench_phase2.cpp` | HNSW build, latency, Recall@10 |
 
@@ -44,6 +45,7 @@ cmake --build build/release -j
 ./build/release/bazavec_tests
 ./build/release/bazavec_phase2_tests
 ./build/release/bazavec_phase3_tests
+./build/release/bazavec_phase4_tests
 ./build/release/bench_bazavec
 ./build/release/bench_phase2
 ```

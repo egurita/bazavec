@@ -75,10 +75,14 @@ bazavec_configure(bazavec_phase3_tests)
 add_executable(bench_phase2 bench/bench_phase2.cpp)
 bazavec_configure(bench_phase2)
 
+add_executable(bazavec_phase4_tests tests/test_phase4.cpp)
+bazavec_configure(bazavec_phase4_tests)
+
 enable_testing()
 add_test(NAME phase1 COMMAND bazavec_tests)
 add_test(NAME phase2 COMMAND bazavec_phase2_tests)
 add_test(NAME phase3 COMMAND bazavec_phase3_tests)
+add_test(NAME phase4 COMMAND bazavec_phase4_tests)
 
 message(STATUS "bazavec processor: ${CMAKE_SYSTEM_PROCESSOR}")
 message(STATUS "bazavec build type: ${CMAKE_BUILD_TYPE}")
