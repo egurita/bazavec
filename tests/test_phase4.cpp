@@ -53,6 +53,8 @@ bazavec::VectorArena make_arena(std::size_t n, std::size_t dim, std::uint32_t se
 }  // namespace
 
 int main() {
+  const auto* digits = reinterpret_cast<const std::uint8_t*>("123456789");
+  CHECK(bazavec::detail::crc32(digits, 9) == 0xcbf43926u);
   constexpr std::size_t kCount = 200;
   constexpr std::size_t kDim = 32;
   bazavec::VectorArena arena = make_arena(kCount, kDim, 7);

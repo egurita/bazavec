@@ -15,6 +15,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#define BAZAVEC_CRC32_HW 1
+#endif
+
 namespace bazavec {
 
 inline constexpr char kBzvMagic[4] = {'B', 'Z', 'V', 'C'};
@@ -38,6 +43,36 @@ inline std::uint32_t get_u32(const std::uint8_t* in) noexcept {
 
 inline std::uint32_t crc32(const std::uint8_t* data, std::size_t n) noexcept {
   std::uint32_t crc = 0xffffffffu;
+#if defined(BAZAVEC_CRC32_HW)
+  // Same ISO polynomial as the byte loop (0xEDB88320). A bit at a time is
+  // about one byte per several cycles, which made a 70 MiB check take
+  // hundreds of milliseconds. The M-series CRC instruction does a word per
+  // instruction.
+  while (n >= 8) {
+    std::uint64_t word = 0;
+    std::memcpy(&word, data, sizeof(word));
+    crc = __crc32d(crc, word);
+    data += 8;
+    n -= 8;
+  }
+  if (n >= 4) {
+    std::uint32_t word = 0;
+    std::memcpy(&word, data, sizeof(word));
+    crc = __crc32w(crc, word);
+    data += 4;
+    n -= 4;
+  }
+  if (n >= 2) {
+    std::uint16_t word = 0;
+    std::memcpy(&word, data, sizeof(word));
+    crc = __crc32h(crc, word);
+    data += 2;
+    n -= 2;
+  }
+  if (n == 1) {
+    crc = __crc32b(crc, data[0]);
+  }
+#else
   for (std::size_t i = 0; i < n; ++i) {
     crc ^= data[i];
     for (int bit = 0; bit < 8; ++bit) {
@@ -45,6 +80,7 @@ inline std::uint32_t crc32(const std::uint8_t* data, std::size_t n) noexcept {
       crc = (crc >> 1) ^ (0xedb88320u & mask);
     }
   }
+#endif
   return ~crc;
 }
 
